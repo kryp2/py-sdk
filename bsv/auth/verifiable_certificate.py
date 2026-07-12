@@ -6,20 +6,12 @@ from typing import Any, Dict, Optional
 
 from bsv.encrypted_message import EncryptedMessage
 from bsv.keys import PublicKey
+from bsv.wallet.wallet_interface import WalletInterface
 
 from .cert_encryption import get_certificate_encryption_details
 
 # Import the real Certificate implementation
 from .certificate import Certificate
-
-
-# Placeholder for WalletInterface (should be implemented or imported)
-class WalletInterface:
-    def decrypt(self, _args: dict, _originator: Optional[str] = None) -> dict:
-        return {}
-
-
-# Removed local stub; using shared module implementation
 
 
 class VerifiableCertificate:

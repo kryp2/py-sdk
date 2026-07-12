@@ -6,6 +6,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Table of Contents
 
+- [2.2.1 - 2026-06-12](#221---2026-06-12)
+- [2.2.0 - 2026-06-10](#220---2026-06-10)
+- [2.1.5 - 2026-06-05](#215---2026-06-05)
 - [2.1.4 - 2026-05-27](#214---2026-05-27)
 - [2.1.2 - 2026-05-20](#212---2026-05-20)
 - [2.1.1 - 2026-05-19](#211---2026-05-19)
@@ -28,6 +31,45 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - [1.0.0 - 2024-12-23](#100---2024-12-23)
 - [0.5.2 - 2024-09-02](#052---2024-09-02)
 - [0.1.0 - 2024-04-09](#010---2024-04-09)
+
+---
+
+## [2.2.1] - 2026-06-12
+
+Re-release of v2.2.0 for PyPI — the original v2.2.0 package was published before #166 was merged, so PyPI's v2.2.0 is missing the fixes below. This release includes no additional code changes beyond v2.2.0 (tag `adaa031`).
+
+### Fixed (included since PyPI v2.2.0)
+
+- Fixed strict DER encoding in `_sign_custom_k()` — R and S values are now encoded with minimal byte length per DER rules, fixing intermittent `ValueError: The DER-encoded signature could not be parsed` in R-puzzle signing.
+- Fixed Black/Ruff lint violations in `wallet_impl.py` and `verifiable_certificate.py`.
+
+---
+
+## [2.2.0] - 2026-06-10
+
+### Changed
+
+- **Breaking:** Removed `WalletInterface` inheritance from `ProtoWallet` — now a standalone class with only cryptographic operations, aligning with TS/Go SDK architecture.
+- Added `DeprecationWarning` to 21 non-crypto `ProtoWallet` methods (`create_action`, `sign_action`, `internalize_action`, `list_actions`, `list_outputs`, `list_certificates`, etc.). Use `Wallet` from `py-wallet-toolbox` instead.
+- `IdentityClient` and `ContactsManager` no longer silently create a dummy `ProtoWallet` when no wallet is provided — they now raise `ValueError("wallet is required")`.
+
+### Fixed
+
+- Replaced local dummy `WalletInterface` class in `verifiable_certificate.py` with proper import from `bsv.wallet.wallet_interface`.
+
+---
+
+## [2.1.5] - 2026-06-05
+
+### Fixed
+
+- Fixed JSON response path in `HTTPSOverlayLookupFacilitator.lookup()` discarding parsed data — `response.json()` result was being thrown away, always returning an empty `LookupAnswer`. Added `_parse_json_response()` to properly construct output-list from JSON responses.
+- Added `_coerce_bytes()` to handle `beef`/`context` encoding differences across overlay server implementations: TS overlay-express sends `number[]`, Go overlay-services sends base64 strings (Go `[]byte` JSON default), hex strings also accepted.
+- Fixed binary lookup response parser: replaced `read_var_int()` with `read_var_int_num()` and added per-output BEEF reconstruction from the trailing combined BEEF.
+
+### Documentation
+
+- Added Ruff/Black linting instructions to `CLAUDE.md`, `CONTRIBUTING.md`, and `.github/pull_request_template.md` for external contributors and AI tools.
 
 ---
 

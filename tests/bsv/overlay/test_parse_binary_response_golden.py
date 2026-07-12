@@ -29,10 +29,7 @@ from bsv.utils import Writer
 
 def _tx_with_outputs(n: int = 1) -> Transaction:
     addr = PrivateKey().address()
-    outputs = [
-        TransactionOutput(locking_script=P2PKH().lock(addr), satoshis=1000 - i)
-        for i in range(n)
-    ]
+    outputs = [TransactionOutput(locking_script=P2PKH().lock(addr), satoshis=1000 - i) for i in range(n)]
     return Transaction([], outputs)
 
 
