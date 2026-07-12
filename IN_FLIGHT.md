@@ -1,10 +1,10 @@
 # IN_FLIGHT — py-sdk
-_Sist oppdatert: 2026-07-04_
+_Sist oppdatert: 2026-07-12_
 
 ## Sist gjort
-- TAAL-ektomi: fjernet døde TAAL API-nøkkel-konstanter fra bsv/constants.py (PR #1 merget)
-- CLAUDE.md trimmet (fjernet Code Architecture og Common Patterns)
-- Fix LookupResolver binary output-list + ARC orphan mempool progressing (#157 upstream)
+- Merget upstream bsv-blockchain/py-sdk master (v2.2.1, 10 commits) — upstream #163 erstattet vår lokale binary-parse-fix f557550 (tok upstreams versjon)
+- Pushet merge + doc-commits til kryp2-forken (d93ed96)
+- Verifisert: py_compile OK på alle 16 endrede filer; full import blokkert av coincurve-build under py3.14 (miljø, ikke kode)
 
 ## Neste
-- uavklart — se git log; vurder om UPSTREAM.md (fork-provenance) skal legges til som i wallet-forkene
+- TAAL-ektomi (69251df) står fortsatt lokalt — vurder om den skal opp som upstream-PR
