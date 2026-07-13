@@ -22,3 +22,7 @@ build/
 
 # Live test run logs (tee + verify_broadcast_log.py)
 tests/bsv/live/.artifacts/
+
+# Interne agent-filer — skal ikke publiseres
+CLAUDE.md
+IN_FLIGHT.md
