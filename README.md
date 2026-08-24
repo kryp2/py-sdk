@@ -1,7 +1,7 @@
 # BSV SDK
 
 [![build](https://github.com/bsv-blockchain/py-sdk/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/bsv-blockchain/py-sdk/actions/workflows/build.yml)
-[![Coverage](https://img.shields.io/badge/coverage-84.6%25-green)](https://github.com/bsv-blockchain/py-sdk/actions/workflows/build.yml)
+[![Coverage](https://img.shields.io/badge/coverage-82.8%25-green)](https://github.com/bsv-blockchain/py-sdk/actions/workflows/build.yml)
 [![PyPI version](https://img.shields.io/pypi/v/bsv-sdk)](https://pypi.org/project/bsv-sdk)
 [![Python versions](https://img.shields.io/pypi/pyversions/bsv-sdk)](https://pypi.org/project/bsv-sdk)
 
@@ -183,7 +183,7 @@ You can also refer to the [User Test Report](./docs/Py-SDK%20User%20Test%20Repor
 This project maintains high code quality standards with comprehensive test coverage:
 
 - **5,400+ tests** covering core functionality
-- **84.6%+ code coverage** across the entire codebase
+- **82.8%+ code coverage** across the entire codebase
 - Automated testing with GitHub Actions CI/CD
 - Python 3.10, 3.11, 3.12, and 3.13 supported
 
