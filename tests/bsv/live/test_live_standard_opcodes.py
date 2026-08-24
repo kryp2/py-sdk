@@ -19,6 +19,32 @@ from .conftest import (
     p2pkh_lock_with_prefix,
 )
 
+
+def custom_unlock_over_subscript(priv_key, subscript: Script):
+    """Sign against `subscript` rather than the input's full locking script.
+
+    Needed when the locking script contains OP_CODESEPARATOR: the signature
+    commits only to what follows it.
+    """
+    from bsv.script.type import to_unlock_script_template
+
+    def sign(tx, input_index) -> Script:
+        tx_input = tx.inputs[input_index]
+        original = tx_input.locking_script
+        tx_input.locking_script = subscript
+        try:
+            preimage = tx.preimage(input_index)
+        finally:
+            tx_input.locking_script = original
+        signature = priv_key.sign(preimage)
+        return Script(
+            encode_pushdata(signature + tx_input.sighash.to_bytes(1, "little"))
+            + encode_pushdata(priv_key.public_key().serialize())
+        )
+
+    return to_unlock_script_template(sign, lambda: 200)
+
+
 # Default: BIP143 v1. A subset also tested with OTDA v2.
 SH = SIGHASH.ALL_FORKID
 SH_C = SIGHASH.ALL_FORKID_CHRONICLE
@@ -283,11 +309,8 @@ class TestArithmeticComparison:
         ids=["and_tt", "and_tf", "or_tf", "or_ff"],
     )
     def test_boolean(self, priv_key, a, b, opcode, expected):
-        _run(
-            priv_key,
-            f"{opcode} {expected} OP_NUMEQUALVERIFY",
-            data_asm=f"{a} {b}",
-        )
+        """Boolean opcodes reuse the comparison harness (same lock/unlock shape)."""
+        self.test_comparison(priv_key, a, b, opcode, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +372,7 @@ class TestBitwiseSplice:
     def test_op_num2bin(self, priv_key):
         """NUM2BIN: convert 5 to 4-byte representation."""
         lock = p2pkh_lock_with_prefix("OP_NUM2BIN 05000000 OP_EQUALVERIFY", priv_key)
-        data = Script.from_asm("OP_5 OP_4")  # value=5, size=4
+        data = Script.from_asm("OP_5 OP_4")  # pushes the value 5 and the target size 4
         unlock = custom_unlock(priv_key, data_prefix_script=data)
         build_signed_tx(lock, unlock, sighash=SH, tx_version=1)
 
@@ -459,17 +482,17 @@ class TestCryptoOps:
         build_signed_tx(lock, unlock, sighash=SH, tx_version=1)
 
     def test_op_codeseparator(self, priv_key):
-        """OP_CODESEPARATOR before CHECKSIG changes subscript for sig hash."""
+        """OP_CODESEPARATOR before CHECKSIG changes subscript for sig hash.
+
+        The signature must commit to the script *after* the separator, so the
+        template signs `subscript` while the output is locked with `lock`.
+        """
         pkh = hash160(priv_key.public_key().serialize())
-        lock = Script(
-            OpCode.OP_CODESEPARATOR
-            + OpCode.OP_DUP
-            + OpCode.OP_HASH160
-            + encode_pushdata(pkh)
-            + OpCode.OP_EQUALVERIFY
-            + OpCode.OP_CHECKSIG
+        subscript = Script(
+            OpCode.OP_DUP + OpCode.OP_HASH160 + encode_pushdata(pkh) + OpCode.OP_EQUALVERIFY + OpCode.OP_CHECKSIG
         )
-        unlock = custom_unlock(priv_key)
+        lock = Script(OpCode.OP_CODESEPARATOR + subscript.serialize())
+        unlock = custom_unlock_over_subscript(priv_key, subscript)
         build_signed_tx(lock, unlock, sighash=SH, tx_version=1)
 
 

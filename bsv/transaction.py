@@ -18,10 +18,17 @@ from .hash import hash256
 from .merkle_path import MerklePath
 from .script.script import Script
 from .script.type import P2PKH
-from .transaction_input import TransactionInput
+from .transaction_input import TransactionInput, txid_to_bytes_le
 from .transaction_output import TransactionOutput
-from .transaction_preimage import tx_preimage
-from .utils import Reader, Writer, reverse_hex_byte_order, unsigned_to_varint
+from .transaction_preimage import _outputs_to_bytes_for_input, tx_preimage
+from .utils import Reader, Writer, unsigned_to_varint
+
+try:
+    import _bsv_native
+
+    _USE_NATIVE_TX = True
+except ImportError:
+    _USE_NATIVE_TX = False
 
 
 # Lazy import to avoid circular dependency
@@ -57,6 +64,38 @@ class Transaction:
         self._cached_txid: Optional[str] = None
 
     def serialize(self) -> bytes:
+        if (
+            _USE_NATIVE_TX
+            and all(type(i) is TransactionInput for i in self.inputs)
+            and all(type(o) is TransactionOutput for o in self.outputs)
+        ):
+            inputs = [
+                {
+                    "source_txid": tx_input.source_txid,
+                    "source_output_index": tx_input.source_output_index,
+                    "unlocking_script": (tx_input.unlocking_script.serialize() if tx_input.unlocking_script else b""),
+                    "sequence": tx_input.sequence,
+                }
+                for tx_input in self.inputs
+            ]
+            outputs = [
+                {
+                    "satoshis": tx_output.satoshis,
+                    "locking_script": tx_output.locking_script.serialize(),
+                }
+                for tx_output in self.outputs
+            ]
+            return _bsv_native.tx_to_bytes(
+                self.version,
+                inputs,
+                outputs,
+                self.locktime,
+            )
+
+        return self._serialize_python()
+
+    def _serialize_python(self) -> bytes:
+        """Serialize using the pure-Python fallback."""
         raw = self.version.to_bytes(4, "little")
         raw += unsigned_to_varint(len(self.inputs))
         for tx_input in self.inputs:
@@ -144,9 +183,8 @@ class Transaction:
         Calculate BIP143/ForkID preimage for signature hashing.
         Uses tx_input.locking_script as the script_code (parameter kept for interface compatibility).
         """
-        from io import BytesIO
-
-        from .utils import unsigned_to_varint
+        if _USE_NATIVE_TX:
+            return self._calc_input_preimage_bip143_native(input_index, hash_type, prev_satoshis)
 
         tx_input = self.inputs[input_index]
 
@@ -160,6 +198,32 @@ class Transaction:
             tx_input, hash_prevouts, hash_sequence, hash_outputs, hash_type, prev_satoshis
         )
 
+    def _calc_input_preimage_bip143_native(self, input_index: int, hash_type: int, prev_satoshis: int) -> bytes:
+        input_tuples = []
+        for i, inp in enumerate(self.inputs):
+            sh = hash_type if i == input_index else int(inp.sighash)
+            sats = prev_satoshis if (prev_satoshis != 0 and i == input_index) else (inp.satoshis or 0)
+            # The signing input's scriptCode enters the digest, so it must be present
+            # (parity with the pure-Python _build_bip143_preimage). A non-signing input's
+            # script never enters this digest, so a missing one is replaced with b"".
+            if i == input_index or inp.locking_script:
+                script = inp.locking_script.serialize()
+            else:
+                script = b""
+            input_tuples.append(
+                (
+                    inp.source_txid,
+                    inp.source_output_index,
+                    script,
+                    sats,
+                    inp.sequence,
+                    sh,
+                )
+            )
+        output_bytes = _outputs_to_bytes_for_input(self.outputs, input_index, hash_type)
+        preimages = _bsv_native.tx_preimages(self.version, self.locktime, input_tuples, output_bytes)
+        return preimages[input_index]
+
     def _calc_hash_prevouts(self, hash_type: int) -> bytes:
         """Calculate hashPrevouts component for BIP143."""
         if hash_type & int(SIGHASH.ANYONECANPAY):
@@ -167,7 +231,7 @@ class Transaction:
 
         prevouts_data = b""
         for inp in self.inputs:
-            prevouts_data += bytes.fromhex(inp.source_txid)[::-1]
+            prevouts_data += txid_to_bytes_le(inp.source_txid)
             prevouts_data += inp.source_output_index.to_bytes(4, "little")
         return hash256(prevouts_data)
 
@@ -220,7 +284,7 @@ class Transaction:
         # 3. hashSequence (32 bytes)
         stream.write(hash_sequence)
         # 4. outpoint (32-byte hash + 4-byte little endian)
-        stream.write(bytes.fromhex(tx_input.source_txid)[::-1])
+        stream.write(txid_to_bytes_le(tx_input.source_txid))
         stream.write(tx_input.source_output_index.to_bytes(4, "little"))
         # 5. scriptCode (varint length + bytes)
         script_bytes = tx_input.locking_script.serialize()
@@ -475,46 +539,52 @@ class Transaction:
         else:
             data = stream if isinstance(stream, bytes) else bytes.fromhex(stream)
             reader = Reader(data)
-        stream = reader
-        version = stream.read_uint32_le()
+        version = reader.read_uint32_le()
         if version != 4022206465:
             raise ValueError(f"Invalid BEEF version. Expected 4022206465, received {version}.")
 
-        number_of_bumps = stream.read_var_int_num()
+        number_of_bumps = reader.read_var_int_num()
         bumps = []
         for _ in range(number_of_bumps):
-            bumps.append(MerklePath.from_reader(stream))
+            bumps.append(MerklePath.from_reader(reader))
 
-        number_of_transactions = stream.read_var_int_num()
+        transactions, last_txid = cls._read_beef_transactions(reader)
+        cls._link_beef_transaction(transactions[last_txid], transactions, bumps)
+        return transactions[last_txid]["tx"]
+
+    @classmethod
+    def _read_beef_transactions(cls, reader: Reader) -> tuple[dict, Optional[str]]:
+        """Read the transaction section of a BEEF stream, returning (transactions, last_txid)."""
+        number_of_transactions = reader.read_var_int_num()
         transactions = {}
         last_txid = None
         for i in range(number_of_transactions):
-            tx = cls.from_reader(stream)
+            tx = cls.from_reader(reader)
             obj = {"tx": tx}
             txid = tx.txid()
             if i + 1 == number_of_transactions:
                 last_txid = txid
-            has_bump = bool(stream.read_uint8())
+            has_bump = bool(reader.read_uint8())
             if has_bump:
-                obj["pathIndex"] = stream.read_var_int_num()
+                obj["pathIndex"] = reader.read_var_int_num()
             transactions[txid] = obj
+        return transactions, last_txid
 
-        def add_path_or_inputs(item):
-            if "pathIndex" in item:
-                path = bumps[item["pathIndex"]]
-                if not isinstance(path, MerklePath):
-                    raise ValueError("Invalid merkle path index found in BEEF!")
-                item["tx"].merkle_path = path
-            else:
-                for tx_input in item["tx"].inputs:
-                    source_obj = transactions[tx_input.source_txid]
-                    if not isinstance(source_obj, dict):
-                        raise ValueError(f"Reference to unknown TXID in BUMP: {tx_input.source_txid}")
-                    tx_input.source_transaction = source_obj["tx"]
-                    add_path_or_inputs(source_obj)
-
-        add_path_or_inputs(transactions[last_txid])
-        return transactions[last_txid]["tx"]
+    @classmethod
+    def _link_beef_transaction(cls, item: dict, transactions: dict, bumps: list) -> None:
+        """Recursively attach merkle paths or source transactions to a parsed BEEF entry."""
+        if "pathIndex" in item:
+            path = bumps[item["pathIndex"]]
+            if not isinstance(path, MerklePath):
+                raise ValueError("Invalid merkle path index found in BEEF!")
+            item["tx"].merkle_path = path
+        else:
+            for tx_input in item["tx"].inputs:
+                source_obj = transactions[tx_input.source_txid]
+                if not isinstance(source_obj, dict):
+                    raise ValueError(f"Reference to unknown TXID in BUMP: {tx_input.source_txid}")
+                tx_input.source_transaction = source_obj["tx"]
+                cls._link_beef_transaction(source_obj, transactions, bumps)
 
     def to_ef(self) -> bytes:
         writer = Writer()
@@ -526,7 +596,7 @@ class Transaction:
             if i.source_transaction is None:
                 raise ValueError("All inputs must have source transactions when serializing to EF format")
             if i.source_txid and i.source_txid != "00" * 32:
-                writer.write(bytes.fromhex(reverse_hex_byte_order(i.source_txid)))
+                writer.write(txid_to_bytes_le(i.source_txid))
             else:
                 writer.write(i.source_transaction.hash())
             writer.write_uint32_le(i.source_output_index)
@@ -549,41 +619,43 @@ class Transaction:
         writer.write_uint32_le(self.locktime)
         return writer.to_bytes()
 
+    @staticmethod
+    def _find_or_combine_bump(bumps: list, merkle_path: "MerklePath") -> Optional[int]:
+        """Return the index of an existing bump matching merkle_path, combining when roots match."""
+        for i, bump in enumerate(bumps):
+            if bump == merkle_path:
+                return i
+            if bump.block_height == merkle_path.block_height:
+                root_a = bump.compute_root()
+                root_b = merkle_path.compute_root()
+                if root_a == root_b:
+                    bump.combine(merkle_path)
+                    return i
+        return None
+
+    def _collect_beef_entries(self, bumps: list, txs: list) -> None:
+        """Recursively collect this transaction and its ancestors into BEEF bump/tx lists."""
+        obj = {"tx": self}
+        has_proof = isinstance(self.merkle_path, MerklePath)
+        if has_proof:
+            index = Transaction._find_or_combine_bump(bumps, self.merkle_path)
+            if index is None:
+                index = len(bumps)
+                bumps.append(self.merkle_path)
+            obj["path_index"] = index
+        txs.insert(0, obj)
+        if not has_proof:
+            for tx_input in self.inputs:
+                if not isinstance(tx_input.source_transaction, Transaction):
+                    raise ValueError("A required source transaction is missing!")
+                tx_input.source_transaction._collect_beef_entries(bumps, txs)
+
     def to_beef(self) -> bytes:
         writer = Writer()
         writer.write_uint32_le(4022206465)
         bumps = []
         txs = []
-
-        def add_paths_and_inputs(tx):
-            obj = {"tx": tx}
-            has_proof = isinstance(tx.merkle_path, MerklePath)
-            if has_proof:
-                added = False
-                for i, bump in enumerate(bumps):
-                    if bump == tx.merkle_path:
-                        obj["path_index"] = i
-                        added = True
-                        break
-                    if bump.block_height == tx.merkle_path.block_height:
-                        root_a = bump.compute_root()
-                        root_b = tx.merkle_path.compute_root()
-                        if root_a == root_b:
-                            bump.combine(tx.merkle_path)
-                            obj["path_index"] = i
-                            added = True
-                            break
-                if not added:
-                    obj["path_index"] = len(bumps)
-                    bumps.append(tx.merkle_path)
-            txs.insert(0, obj)
-            if not has_proof:
-                for tx_input in tx.inputs:
-                    if not isinstance(tx_input.source_transaction, Transaction):
-                        raise ValueError("A required source transaction is missing!")
-                    add_paths_and_inputs(tx_input.source_transaction)
-
-        add_paths_and_inputs(self)
+        self._collect_beef_entries(bumps, txs)
 
         writer.write_var_int_num(len(bumps))
         for b in bumps:
@@ -604,6 +676,11 @@ class Transaction:
 
         Raises ValueError if data is invalid or incomplete.
         """
+        if _USE_NATIVE_TX:
+            native_tx = cls._from_reader_native(reader)
+            if native_tx is not None:
+                return native_tx
+
         t = cls()
         t.version = reader.read_uint32_le()
         if t.version is None:
@@ -635,6 +712,45 @@ class Transaction:
 
         return t
 
+    @classmethod
+    def _from_reader_native(cls, reader: Reader) -> Optional["Transaction"]:
+        """Try parsing via the native backend; return None to fall back to pure Python."""
+        pos_before = reader.tell()
+        remaining = reader.getvalue()[pos_before:]
+        if not remaining:
+            return None
+        try:
+            d = _bsv_native.tx_from_bytes(remaining)
+            reader.seek(pos_before + d["bytes_read"])
+            return cls._from_native_dict(d)
+        except ValueError:
+            reader.seek(pos_before)
+            return None
+
+    @classmethod
+    def _from_native_dict(cls, d: dict) -> "Transaction":
+        """Construct a Transaction from the dict returned by _bsv_native.tx_from_bytes."""
+        t = cls()
+        t.version = d["version"]
+        t.locktime = d["locktime"]
+        for inp_d in d["inputs"]:
+            t.inputs.append(
+                TransactionInput(
+                    source_txid=inp_d["source_txid"],
+                    source_output_index=inp_d["source_output_index"],
+                    unlocking_script=Script(inp_d["unlocking_script"]),
+                    sequence=inp_d["sequence"],
+                )
+            )
+        for out_d in d["outputs"]:
+            t.outputs.append(
+                TransactionOutput(
+                    locking_script=Script(out_d["locking_script"]),
+                    satoshis=out_d["satoshis"],
+                )
+            )
+        return t
+
     async def verify(self, chaintracker: Optional[ChainTracker] = default_chain_tracker(), scripts_only=False) -> bool:
         if self.merkle_path and not scripts_only:
             proof_valid = await self.merkle_path.verify(self.txid(), chaintracker)
@@ -663,14 +779,25 @@ class Transaction:
             if not input_verified:
                 return False
 
-            # Use Engine-based script interpreter (matches Go SDK implementation)
-            from bsv.script.interpreter import Engine, with_after_genesis, with_fork_id, with_tx
+            other_inputs = [inp for j, inp in enumerate(self.inputs) if j != i]
 
-            engine = Engine()
-            err = engine.execute(with_tx(self, i, source_output), with_after_genesis(), with_fork_id())
-
-            if err is not None:
-                # Script verification failed
+            try:
+                Spend(
+                    {
+                        "sourceTXID": tx_input.source_txid or tx_input.source_transaction.txid(),
+                        "sourceOutputIndex": tx_input.source_output_index,
+                        "sourceSatoshis": source_output.satoshis,
+                        "lockingScript": source_output.locking_script,
+                        "transactionVersion": self.version,
+                        "otherInputs": other_inputs,
+                        "inputIndex": i,
+                        "unlockingScript": tx_input.unlocking_script,
+                        "outputs": self.outputs,
+                        "inputSequence": tx_input.sequence,
+                        "lockTime": self.locktime,
+                    }
+                ).validate()
+            except RuntimeError:
                 return False
 
         # All inputs verified successfully

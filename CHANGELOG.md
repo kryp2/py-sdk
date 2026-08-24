@@ -6,6 +6,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Table of Contents
 
+- [Unreleased](#unreleased)
+- [2.3.3 - 2026-07-23](#233---2026-07-23)
+- [2.3.1 - 2026-07-22](#231---2026-07-22)
+- [2.3.0 - 2026-07-21](#230---2026-07-21)
 - [2.2.1 - 2026-06-12](#221---2026-06-12)
 - [2.2.0 - 2026-06-10](#220---2026-06-10)
 - [2.1.5 - 2026-06-05](#215---2026-06-05)
@@ -31,6 +35,54 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - [1.0.0 - 2024-12-23](#100---2024-12-23)
 - [0.5.2 - 2024-09-02](#052---2024-09-02)
 - [0.1.0 - 2024-04-09](#010---2024-04-09)
+
+---
+
+## [Unreleased]
+
+### Fixed
+
+- **Numeric operands must be minimally encoded where minimal pushes are** — the node derives one `requireMinimal` from `VerifyMinimalData(flags) && EnforceNonMalleability(flags, version)` and uses it both for `CheckMinimalPush` and for every `CScriptNum` construction. py-sdk applied it to pushes only, so `0x0100` — a minimal *push* but a non-minimal *number* for 1 — was accepted as an operand where the node rejects it, as was negative zero (`0x80`). Now enforced on both VM paths, and relaxed for transaction version > 1 alongside minimal pushes. `OP_BIN2NUM` is deliberately exempt: minimising a non-minimal encoding is what it is for, and the node reads its input directly rather than through `CScriptNum`.
+
+---
+
+## [2.3.3] - 2026-07-23
+
+### Fixed
+
+- **Native `tx_preimage` no longer crashes on inputs/outputs the signature does not commit to** (#187, #188) — `Transaction.preimage(i)` raised `AttributeError: 'NoneType' object has no attribute 'serialize'` on the native (`_bsv_native`) path when another input's `locking_script` was `None` (e.g. a transaction parsed with `Transaction.from_hex()` where only the signing input's prev-output had been restored). This was a regression versus the 2.2.x pure-Python path. The single-input preimage now replaces only a *non-signing* input's missing script with `b""` (it never enters the BIP143/OTDA digest — it contributes only outpoints and sequences) while still requiring the *signing* input's script, and serializes only the outputs the sighash commits to (defensively zero-filling a *non-committed* unfunded amount). A committed missing script/amount still raises on both paths, so no silently-wrong signatures. The native path stays byte-identical to the pure-Python path for every funded, restored transaction.
+- **`verify_broadcast_log` path-resolution hardening** (#186) — severed CLI-argument taint in the broadcast-log path resolution (SonarCloud `pythonsecurity:S8707`).
+
+---
+
+## [2.3.1] - 2026-07-22
+
+Re-release of v2.3.0 for PyPI — the v2.3.0 tag build failed due to an invalid `license` field in `pyproject.toml`. This release includes the license metadata fix; no other code changes beyond v2.3.0.
+
+### Fixed
+
+- Fixed `license = {text = "MIT"}` → `license = "LicenseRef-Open-BSV-4"` (PEP 639 compliant format + correct license name) — resolves `InvalidDistribution: unrecognized or malformed field 'license-file'` in twine check.
+
+---
+
+## [2.3.0] - 2026-07-21
+
+### Added
+
+- **Native C extension (`_bsv_native`)** — libsecp256k1 statically linked via CPython C extension for ECDSA sign/verify/recover, SHA256/hash256, public key operations, ECDH, Schnorr signatures, and BRC-42 key derivation. Falls back to pure Python ECDSA when the extension is unavailable.
+- **ARC broadcaster format selection** — `ARCConfig(format=...)` enables three submission formats: `"json"` (default, backward compatible), `"raw"` (application/octet-stream + binary), and `"beef"` (application/beef + BEEF binary).
+- **Arcade broadcaster** (`bsv/broadcasters/arcade.py`) — Teranode-native, ARC-compatible broadcaster. Root-level `/tx` endpoints, EF submission preferred, separate from `ARC` class mirroring the TS SDK design.
+- **Binary send path in HTTP client** — `DefaultHttpClient.fetch()` and `SyncHttpClient.fetch()` now accept `raw_data` for binary payloads alongside the existing JSON `data` path.
+- **CI wheel pipeline** — cibuildwheel builds for Linux (x86_64/aarch64), macOS (x86_64/arm64), and Windows (AMD64) with pure Python fallback verification.
+
+### Changed
+
+- **Removed `coincurve` dependency** — replaced by the native C extension with pure Python ECDSA fallback. No external cryptographic library required at runtime.
+- **Script Engine consolidation** — removed the `bsv/script/interpreter/` Engine (~9,100 lines). All script validation is now handled by `Spend`, eliminating the dual-implementation.
+
+### Performance
+
+- **`txid()` / `hash()` caching** — transaction hash is computed once and cached; invalidated automatically on `add_input()` / `add_output()`. Avoids redundant serialize + SHA256 on repeated calls.
 
 ---
 

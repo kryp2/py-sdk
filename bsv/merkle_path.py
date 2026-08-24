@@ -4,12 +4,31 @@ from .chaintracker import ChainTracker
 from .hash import hash256
 from .utils import Reader, Writer, to_bytes, to_hex
 
+try:
+    import _bsv_native
+
+    _USE_NATIVE = True
+except ImportError:
+    _USE_NATIVE = False
+
 
 class MerkleLeaf(TypedDict, total=False):
     offset: int
     hash_str: Optional[str]
     txid: Optional[bool]
     duplicate: Optional[bool]
+
+
+def _push_if_new(v: int, a: list[int]) -> None:
+    if not a or a[-1] != v:
+        a.append(v)
+
+
+def _next_computed_offsets(cos: list[int]) -> list[int]:
+    ncos: list[int] = []
+    for o in cos:
+        _push_if_new(o >> 1, ncos)
+    return ncos
 
 
 class MerklePath:
@@ -221,6 +240,9 @@ class MerklePath:
         except StopIteration:
             raise ValueError(f"This proof does not contain the txid: {txid}")
 
+        if _USE_NATIVE:
+            return self._compute_root_native(txid, index)
+
         # Calculate the root using the index as a way to determine which direction to concatenate.
         def hash_fn(m: str) -> str:
             return to_hex(hash256(to_bytes(m, "hex")[::-1])[::-1])
@@ -241,7 +263,35 @@ class MerklePath:
 
         return working_hash
 
+    def _compute_root_native(self, txid: str, index: int) -> str:
+        """Compute root using C extension. Full-C path for complete proofs, per-level fallback otherwise."""
+        try:
+            return _bsv_native.merkle_compute_root(txid, self.path)
+        except (ValueError, TypeError):
+            pass
+
+        working_hash = txid
+        for height in range(len(self.path)):
+            offset = (index >> height) ^ 1
+            leaf = self.find_or_compute_leaf(height, offset)
+            if not isinstance(leaf, dict):
+                raise ValueError(f"Missing hash for index {index} at height {height}")
+
+            if leaf.get("duplicate"):
+                working_hash = _bsv_native.merkle_hash_pair(working_hash, working_hash)
+            elif offset % 2 != 0:
+                working_hash = _bsv_native.merkle_hash_pair(leaf["hash_str"], working_hash)
+            else:
+                working_hash = _bsv_native.merkle_hash_pair(working_hash, leaf["hash_str"])
+
+        return working_hash
+
     def find_or_compute_leaf(self, height: int, offset: int) -> Optional[MerkleLeaf]:
+        if _USE_NATIVE:
+            return self._find_or_compute_leaf_native(height, offset)
+        return self._find_or_compute_leaf_py(height, offset)
+
+    def _find_or_compute_leaf_py(self, height: int, offset: int) -> Optional[MerkleLeaf]:
         def hash_fn(m: str) -> str:
             return to_hex(hash256(to_bytes(m, "hex")[::-1])[::-1])
 
@@ -255,11 +305,11 @@ class MerklePath:
         h = height - 1
         e = offset << 1
 
-        leaf0 = self.find_or_compute_leaf(h, e)
+        leaf0 = self._find_or_compute_leaf_py(h, e)
         if not leaf0 or not leaf0.get("hash_str"):
             return None
 
-        leaf1 = self.find_or_compute_leaf(h, e + 1)
+        leaf1 = self._find_or_compute_leaf_py(h, e + 1)
         if not leaf1:
             return None
 
@@ -267,6 +317,32 @@ class MerklePath:
             working_hash = hash_fn(leaf0["hash_str"] + leaf0["hash_str"])
         else:
             working_hash = hash_fn(leaf1["hash_str"] + leaf0["hash_str"])
+
+        return {"offset": offset, "hash_str": working_hash}
+
+    def _find_or_compute_leaf_native(self, height: int, offset: int) -> Optional[MerkleLeaf]:
+        leaf = next((e for e in self.path[height] if e["offset"] == offset), None)
+        if leaf:
+            return leaf
+
+        if height == 0:
+            return None
+
+        h = height - 1
+        e = offset << 1
+
+        leaf0 = self._find_or_compute_leaf_native(h, e)
+        if not leaf0 or not leaf0.get("hash_str"):
+            return None
+
+        leaf1 = self._find_or_compute_leaf_native(h, e + 1)
+        if not leaf1:
+            return None
+
+        if leaf1.get("duplicate"):
+            working_hash = _bsv_native.merkle_hash_pair(leaf0["hash_str"], leaf0["hash_str"])
+        else:
+            working_hash = _bsv_native.merkle_hash_pair(leaf1["hash_str"], leaf0["hash_str"])
 
         return {"offset": offset, "hash_str": working_hash}
 
@@ -303,19 +379,21 @@ class MerklePath:
         if root1 != root2:
             raise ValueError("You cannot combine paths which do not have the same root.")
 
-        combined_path = []
-        for h in range(len(self.path)):
-            combined_level = self.path[h] + [
-                leaf for leaf in other.path[h] if leaf["offset"] not in {e["offset"] for e in self.path[h]}
-            ]
-            for leaf in other.path[h]:
-                if "txid" in leaf:
-                    for e in combined_level:
-                        if e["offset"] == leaf["offset"]:
-                            e["txid"] = True
-            combined_path.append(combined_level)
+        combined_path = [self._combine_levels(self.path[h], other.path[h]) for h in range(len(self.path))]
         self.path = combined_path
         self.trim()
+
+    @staticmethod
+    def _combine_levels(own_level: list, other_level: list) -> list:
+        """Merge one level of another path into this path's level, preserving txid flags."""
+        own_offsets = {e["offset"] for e in own_level}
+        combined_level = own_level + [leaf for leaf in other_level if leaf["offset"] not in own_offsets]
+        for leaf in other_level:
+            if "txid" in leaf:
+                for e in combined_level:
+                    if e["offset"] == leaf["offset"]:
+                        e["txid"] = True
+        return combined_level
 
     def trim(self) -> None:
         """
@@ -323,40 +401,33 @@ class MerklePath:
         Assumes that at least all required nodes are present.
         Leaves all levels sorted by increasing offset.
         """
-
-        def push_if_new(v: int, a: list[int]) -> None:
-            if not a or a[-1] != v:
-                a.append(v)
-
-        def drop_offsets_from_level(drop_offsets: list[int], level: int) -> None:
-            for i in reversed(drop_offsets):
-                idx = next((j for j, n in enumerate(self.path[level]) if n["offset"] == i), None)
-                if idx is not None:
-                    self.path[level].pop(idx)
-
-        def next_computed_offsets(cos: list[int]) -> list[int]:
-            ncos = []
-            for o in cos:
-                push_if_new(o >> 1, ncos)
-            return ncos
-
-        computed_offsets = []
-        drop_offsets = []
         for h in range(len(self.path)):
             self.path[h].sort(key=lambda x: x["offset"])
 
+        computed_offsets, drop_offsets = self._trim_level_zero_offsets()
+
+        self._drop_offsets_from_level(drop_offsets, 0)
+        for h in range(1, len(self.path)):
+            drop_offsets = computed_offsets
+            computed_offsets = _next_computed_offsets(computed_offsets)
+            self._drop_offsets_from_level(drop_offsets, h)
+
+    def _trim_level_zero_offsets(self) -> tuple[list[int], list[int]]:
+        """Scan level zero, returning (offsets computed upward, offsets droppable at level zero)."""
+        computed_offsets: list[int] = []
+        drop_offsets: list[int] = []
         for e in self.path[0]:
             if e.get("txid"):
-                push_if_new(e["offset"] >> 1, computed_offsets)
+                _push_if_new(e["offset"] >> 1, computed_offsets)
             else:
                 is_odd = e["offset"] % 2 == 1
                 peer = next((n for n in self.path[0] if n["offset"] == e["offset"] + (1 if is_odd else -1)), None)
                 if peer and not peer.get("txid"):
-                    push_if_new(peer["offset"], drop_offsets)
+                    _push_if_new(peer["offset"], drop_offsets)
+        return computed_offsets, drop_offsets
 
-        drop_offsets_from_level(drop_offsets, 0)
-        # print('testing', self.path)
-        for h in range(1, len(self.path)):
-            drop_offsets = computed_offsets
-            computed_offsets = next_computed_offsets(computed_offsets)
-            drop_offsets_from_level(drop_offsets, h)
+    def _drop_offsets_from_level(self, drop_offsets: list[int], level: int) -> None:
+        for i in reversed(drop_offsets):
+            idx = next((j for j, n in enumerate(self.path[level]) if n["offset"] == i), None)
+            if idx is not None:
+                self.path[level].pop(idx)

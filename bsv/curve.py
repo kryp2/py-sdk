@@ -1,8 +1,6 @@
 from collections import namedtuple
 from typing import Optional
 
-from coincurve import PublicKey as CcPublicKey
-
 from .constants import NUMBER_BYTE_LENGTH
 
 Point = namedtuple("Point", "x y")
@@ -20,6 +18,22 @@ curve = EllipticCurve(
     n=0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141,
     h=1,
 )
+
+# Crypto backend: _bsv_native (direct libsecp256k1) → pure Python fallback
+_CRYPTO_BACKEND = None
+
+try:
+    import _bsv_native
+
+    _CRYPTO_BACKEND = "native"
+except ImportError:
+    _CRYPTO_BACKEND = "python"
+
+
+def _point_to_pubkey_bytes(point: Point) -> bytes:
+    x_bytes = point.x.to_bytes(32, "big")
+    y_bytes = point.y.to_bytes(32, "big")
+    return b"\x04" + x_bytes + y_bytes
 
 
 def on_curve(point: Optional[Point]) -> bool:
@@ -39,12 +53,31 @@ def curve_negative(point: Optional[Point]) -> Optional[Point]:
     """
     assert on_curve(point)
     if point is None:
-        # -0 = 0
+        # the point at infinity is its own negative
         return None
     x, y = point
     r = Point(x, -y % curve.p)
     assert on_curve(r)
     return r
+
+
+def _py_point_add(p: Optional[Point], q: Optional[Point]) -> Optional[Point]:
+    if p is None:
+        return q
+    if q is None:
+        return p
+    if p.x == q.x:
+        if p.y == q.y:
+            if p.y == 0:
+                return None
+            lam = (3 * p.x * p.x + curve.a) * pow(2 * p.y, -1, curve.p) % curve.p
+        else:
+            return None
+    else:
+        lam = (q.y - p.y) * pow(q.x - p.x, -1, curve.p) % curve.p
+    x3 = (lam * lam - p.x - q.x) % curve.p
+    y3 = (lam * (p.x - x3) - p.y) % curve.p
+    return Point(x3, y3)
 
 
 def curve_add(p: Optional[Point], q: Optional[Point]) -> Optional[Point]:
@@ -54,16 +87,24 @@ def curve_add(p: Optional[Point], q: Optional[Point]) -> Optional[Point]:
     assert on_curve(p)
     assert on_curve(q)
     if p is None:
-        # 0 + q = q
+        # adding the point at infinity leaves q unchanged
         return q
     if q is None:
-        # p + 0 = p
+        # adding the point at infinity leaves p unchanged
         return p
     if p == curve_negative(q):
-        # p == -q
+        # p is the negative of q, so the sum is the point at infinity
         return None
     # p != -q
-    r = Point(*CcPublicKey.from_point(*p).combine([CcPublicKey.from_point(*q)]).point())
+    if _CRYPTO_BACKEND == "native":
+        pk_p = _point_to_pubkey_bytes(p)
+        pk_q = _point_to_pubkey_bytes(q)
+        combined = _bsv_native.pubkey_combine([pk_p, pk_q], False)
+        x = int.from_bytes(combined[1:33], "big")
+        y = int.from_bytes(combined[33:65], "big")
+        r = Point(x, y)
+    else:
+        r = _py_point_add(p, q)
     assert on_curve(r)
     return r
 
@@ -76,9 +117,25 @@ def curve_multiply(scalar: int, point: Optional[Point]) -> Optional[Point]:
     if scalar % curve.n == 0 or point is None:
         return None
     if scalar < 0:
-        # k * point = -k * (-point)
+        # multiplying by a negative scalar equals multiplying the negated point by the positive scalar
         return curve_multiply(-scalar, curve_negative(point))
-    r = Point(*CcPublicKey.from_point(*point).multiply((scalar % curve.n).to_bytes(NUMBER_BYTE_LENGTH, "big")).point())
+    if _CRYPTO_BACKEND == "native":
+        pk = _point_to_pubkey_bytes(point)
+        scalar_bytes = (scalar % curve.n).to_bytes(NUMBER_BYTE_LENGTH, "big")
+        result = _bsv_native.pubkey_tweak_mul(pk, scalar_bytes, False)
+        x = int.from_bytes(result[1:33], "big")
+        y = int.from_bytes(result[33:65], "big")
+        r = Point(x, y)
+    else:
+        result = None
+        addend = point
+        s = scalar % curve.n
+        while s:
+            if s & 1:
+                result = _py_point_add(result, addend)
+            addend = _py_point_add(addend, addend)
+            s >>= 1
+        r = result
     assert on_curve(r)
     return r
 
@@ -89,4 +146,5 @@ def curve_get_y(x: int, even: bool) -> int:
     """
     y_square = (x * x * x + curve.a * x + curve.b) % curve.p
     y = pow(y_square, (curve.p + 1) // 4, curve.p)
-    return y if (y + (0 if even else 1)) % 2 == 0 else -y % curve.p
+    y_is_even = y % 2 == 0
+    return y if y_is_even == even else -y % curve.p
